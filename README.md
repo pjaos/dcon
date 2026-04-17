@@ -179,3 +179,12 @@ main()
 ```
 
 Worker threads never touch the GUI directly. All discovery data flows through a `queue.Queue`; a 100 ms NiceGUI timer drains it on the main thread and re-renders the Discovered Services table only when new services have been found. The Configured Services table is re-rendered immediately after any add, edit, or delete action.
+
+## Author
+
+Paul Austen — [pjaos@gmail.com](mailto:pjaos@gmail.com)
+
+## Acknowledgements
+
+Development of this project was assisted by [Claude](https://claude.ai) (Anthropic's AI assistant),
+which contributed to code review, bug identification, test generation, and this documentation.
