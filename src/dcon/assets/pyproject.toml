@@ -1,0 +1,29 @@
+[project]
+name = "dcon"
+version = "0.1.0"
+description = "An app to enable a single point of connectivity to the various in house devices and software programs that provide interfaces to other devices."
+authors = [
+    {name = "Paul Austen",email = "pjaos@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10.12,<4"
+dependencies = [
+]
+
+[tool.poetry]
+packages = [{include = "dcon", from = "src"}]
+
+[tool.poetry.dependencies]
+pytest = "*"
+nicegui = "^3.10.0"
+p3lib = "^1.1.158"
+rich = "*"
+psutil = "*"
+pillow = "*"
+
+[tool.poetry.scripts]
+dcon = "dcon.dcon:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
