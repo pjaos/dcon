@@ -13,7 +13,7 @@ from threading import Thread
 from time import time, sleep
 from pathlib import Path
 
-from nicegui import ui, app
+from nicegui import ui, app, Client
 
 from p3lib.uio import UIO
 from p3lib.helper import logTraceBack
@@ -393,6 +393,18 @@ def parse_services(dev_dict: dict) -> list[ServiceEntry]:
     return entries
 
 
+from dataclasses import dataclass
+
+@dataclass
+class _ConnCtx:
+    """Holds all per-browser-connection UI state so multiple simultaneous
+    connections (local + remote) each get their own isolated references."""
+    is_local:             bool
+    table_container:      object = None   # ui.element for discovered table
+    cfg_table_container:  object = None   # ui.element for configured table
+    status_el:            object = None   # ui.html status bar element
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main application class
 # ─────────────────────────────────────────────────────────────────────────────
@@ -407,6 +419,38 @@ class DCon(object):
     AYT_TX_SECS    = [0.25,0.5,1,2,5,10,20,30] # We send AYT msgs quickly (after 0.25 seconds) initially
                                                # then backoff to every 30 seconds. This should update the
                                                # GUI quickly with contactable devices.
+
+    # Ports that map unambiguously to a URI scheme.
+    # Any unlisted port defaults to http://.
+    _SCHEME_MAP: dict = {
+        21:   "ftp",
+        22:   "ssh",
+        23:   "telnet",
+        80:   "http",
+        443:  "https",
+        445:  "smb",
+        554:  "rtsp",
+        990:  "ftps",
+        3389: "rdp",
+        5900: "vnc",
+        8080: "http",
+        8443: "https",
+    }
+
+    @staticmethod
+    def _make_url(ip: str, port: int) -> str:
+        """Return the most appropriate URL for ip:port, based on _SCHEME_MAP.
+        Unknown ports default to http://."""
+        scheme = DCon._SCHEME_MAP.get(port, "http")
+        return f"{scheme}://{ip}:{port}"
+
+    @staticmethod
+    def _is_local_client() -> bool:
+        """True when the browser connecting is on the same machine as the server."""
+        try:
+            return Client.current.ip in ('127.0.0.1', '::1')
+        except Exception:
+            return True   # safe default — behave as local if we can't tell
 
     @staticmethod
     def GetAppDataPath(app_name: str) -> Path:
@@ -441,8 +485,20 @@ class DCon(object):
         # Start background thread to ping configured service IPs periodically
         ping_thread = Thread(target=self._ping_loop, daemon=True)
         ping_thread.start()
-        self._build_gui()
-        ui.run(title="DCON – Device Connector", reload=False, port=self._options.port, show=True)
+
+        dcon_instance = self
+
+        @ui.page('/')
+        def index(client: Client):
+            # Determine local vs remote once per browser connection, using the
+            # Client parameter which NiceGUI populates reliably at page-request
+            # time (unlike Client.current which is None during startup).
+            is_local = client.ip in ('127.0.0.1', '::1')
+            dcon_instance._build_gui(is_local)
+
+        host = '127.0.0.1' if self._options.local else self._options.host
+        ui.run(title="DCON – Device Connector", reload=False, port=self._options.port,
+               host=host, show=True)
 
     def _start_dev_listener(self):
         for port in (2939, 29340, 2934):
@@ -492,8 +548,10 @@ class DCon(object):
 
     # ── GUI ────────────────────────────────────────────────────────────────
 
-    def _build_gui(self):
-        """Construct the NiceGUI layout."""
+    def _build_gui(self, is_local: bool = True):
+        """Construct the NiceGUI layout for one browser connection.
+        Each call gets its own _ConnCtx so local and remote browsers are isolated."""
+        ctx = _ConnCtx(is_local=is_local)
         # ── Styling ──────────────────────────────────────────────────────
         ui.add_head_html("""
         <style>
@@ -602,20 +660,20 @@ class DCon(object):
 
             # ── Discovered Services panel ─────────────────────────────────
             with ui.tab_panel(tab_discovered).style('padding:16px 24px;'):
-                self._table_container = ui.element('div')
-                with self._table_container:
-                    self._render_discovered_table()
+                ctx.table_container = ui.element('div')
+                with ctx.table_container:
+                    self._render_discovered_table(ctx)
 
             # ── Configured Services panel ─────────────────────────────────
             with ui.tab_panel(tab_configured).style('padding:16px 24px;'):
-                self._cfg_table_container = ui.element('div')
-                with self._cfg_table_container:
-                    self._render_configured_table()
+                ctx.cfg_table_container = ui.element('div')
+                with ctx.cfg_table_container:
+                    self._render_configured_table(ctx)
                 # Add button sits below the table
                 with ui.row().style('margin-top:12px; align-items:center; gap:8px;'):
                     ui.button(
                         '＋ Add service',
-                        on_click=lambda: self._on_cfg_add(),
+                        on_click=lambda: self._on_cfg_add(ctx),
                     ).props('unelevated').style(
                         'background:var(--accent);color:#000;font-size:.8rem;'
                     )
@@ -625,7 +683,7 @@ class DCon(object):
             'display:flex; align-items:center; justify-content:space-between;'
             'border-top:1px solid var(--border); background:var(--surface);'
         ):
-            self._status_el = ui.html('<div class="status-bar">Scanning LAN…</div>')
+            ctx.status_el = ui.html('<div class="status-bar">Scanning LAN…</div>')
             ui.button(
                 'Shutdown DCON',
                 on_click=self._shutdown,
@@ -634,8 +692,9 @@ class DCon(object):
                 'font-size:.75rem;padding:4px 20px;letter-spacing:1px;'
             )
 
-        # ── 100 ms timer that drains the queue and refreshes the GUI ──────
-        ui.timer(0.1, self._poll_queue)
+        # ── 100 ms timer — each connection gets its own timer that polls the
+        # shared queue but updates only this connection's UI elements via ctx ──
+        ui.timer(0.1, lambda: self._poll_queue(ctx))
 
     def _shutdown(self):
         """Show a full-page shutdown overlay then stop the server after a short
@@ -674,10 +733,11 @@ class DCon(object):
         """)
         ui.timer(1.5, app.shutdown, once=True)
 
-    def _render_discovered_table(self):
-        """(Re)render the discovered-services table inside _table_container."""
-        self._table_container.clear()
-        with self._table_container:
+    def _render_discovered_table(self, ctx: _ConnCtx):
+        """(Re)render the discovered-services table inside ctx.table_container."""
+        ctx.table_container.clear()
+        is_local = ctx.is_local
+        with ctx.table_container:
             if not self._services:
                 ui.html('<div style="color:var(--muted);padding:32px;text-align:center;font-family:var(--font-ui);font-size:.9rem;">No devices found yet…</div>')
                 return
@@ -685,7 +745,10 @@ class DCon(object):
             with ui.element('table').classes('services-table'):
                 with ui.element('thead'):
                     with ui.element('tr'):
-                        for col in ("Device Name", "Device Address", "Port", "Command", ""):
+                        cols = ("Device Name", "Device Address", "Port", "Command", "Connect", "") \
+                               if not is_local else \
+                               ("Device Name", "Device Address", "Port", "Command", "")
+                        for col in cols:
                             ui.element('th').text = col
 
                 with ui.element('tbody'):
@@ -694,29 +757,44 @@ class DCon(object):
                         label      = svc.custom_label or svc.product_id
                         label_html = (f'<span style="color:#e3b341">{label}</span>'
                                       if svc.custom_label else label)
-                        row        = ui.element('tr')
+                        row = ui.element('tr')
                         with row:
                             with ui.element('td').style('cursor:context-menu'):
-                                ui.html(f'{label_html}')
+                                ui.html(label_html)
                             with ui.element('td').classes('mono'):
                                 ui.html(svc.ip)
                             with ui.element('td').classes('mono'):
                                 ui.html(str(svc.port))
                             ui.element('td').text = cmd or "—"
+
+                            if not is_local:
+                                # Remote browser: show a clickable link
+                                url = self._make_url(svc.ip, svc.port)
+                                with ui.element('td'):
+                                    ui.html(
+                                        f'<a href="{url}" target="_blank" rel="noopener noreferrer" '
+                                        f'style="color:var(--accent);font-family:var(--font-mono);'
+                                        f'font-size:.82rem;text-decoration:none;" '
+                                        f'title="Open {url}">'
+                                        f'⎋ {url}</a>'
+                                    )
+
                             with ui.element('td').style('padding:4px 8px; width:1px; white-space:nowrap'):
-                                ui.button('✎ Edit', on_click=lambda e, s=svc: self._on_edit(s)) \
+                                ui.button('✎ Edit', on_click=lambda e, s=svc: self._on_edit(s, ctx)) \
                                   .props('flat dense size=sm') \
                                   .style('color:var(--muted);font-family:var(--font-ui);font-size:.78rem;')
 
-                        # Double-click → launch
-                        row.on('dblclick', lambda e, s=svc: self._on_launch(s))
-                        # Right-click → unified edit dialog
-                        row.on('contextmenu', lambda e, s=svc: self._on_edit(s))
+                        if is_local:
+                            # Local browser: double-click launches the configured command
+                            row.on('dblclick', lambda e, s=svc: self._on_launch(s))
+                        # Right-click edit works in both modes
+                        row.on('contextmenu', lambda e, s=svc: self._on_edit(s, ctx))
 
-    def _render_configured_table(self):
+    def _render_configured_table(self, ctx: _ConnCtx):
         """(Re)render the manually-configured services table."""
-        self._cfg_table_container.clear()
-        with self._cfg_table_container:
+        ctx.cfg_table_container.clear()
+        is_local = ctx.is_local
+        with ctx.cfg_table_container:
             records = self._cfg_svc_store.all()
             if not records:
                 ui.html('<div style="color:var(--muted);padding:32px;text-align:center;font-family:var(--font-ui);font-size:.9rem;">No configured services yet — click ＋ Add service to add one.</div>')
@@ -725,20 +803,23 @@ class DCon(object):
             with ui.element('table').classes('services-table'):
                 with ui.element('thead'):
                     with ui.element('tr'):
-                        for col in ("Service Name", "IP Address", "Port", ""):
+                        cols = ("Service Name", "IP Address", "Port", "Connect", "") \
+                               if not is_local else \
+                               ("Service Name", "IP Address", "Port", "")
+                        for col in cols:
                             ui.element('th').text = col
 
                 with ui.element('tbody'):
                     for rec in sorted(records, key=lambda r: r["name"].lower()):
                         ip        = rec["ip"]
                         cache_key = f"{ip}:{rec['port']}"
-                        reachable = self._ping_cache.get(cache_key)   # None = not yet tested
+                        reachable = self._ping_cache.get(cache_key)
                         if reachable is True:
-                            row_color = 'color:var(--accent2)'   # green
+                            row_color = 'color:var(--accent2)'
                         elif reachable is False:
-                            row_color = 'color:var(--danger)'    # red
+                            row_color = 'color:var(--danger)'
                         else:
-                            row_color = 'color:var(--text)'      # default (pending)
+                            row_color = 'color:var(--text)'
 
                         row = ui.element('tr')
                         with row:
@@ -748,22 +829,37 @@ class DCon(object):
                                 ui.html(ip)
                             with ui.element('td').classes('mono').style(row_color):
                                 ui.html(str(rec["port"]))
+
+                            if not is_local:
+                                # Remote browser: show a clickable link
+                                url = self._make_url(ip, rec["port"])
+                                with ui.element('td'):
+                                    ui.html(
+                                        f'<a href="{url}" target="_blank" rel="noopener noreferrer" '
+                                        f'style="color:var(--accent);font-family:var(--font-mono);'
+                                        f'font-size:.82rem;text-decoration:none;" '
+                                        f'title="Open {url}">'
+                                        f'⎋ {url}</a>'
+                                    )
+
                             with ui.element('td').style('padding:4px 8px; width:1px; white-space:nowrap'):
                                 with ui.row().style('gap:4px; flex-wrap:nowrap;'):
                                     ui.button('✎ Edit',
-                                              on_click=lambda e, r=rec: self._on_cfg_edit(r)) \
+                                              on_click=lambda e, r=rec: self._on_cfg_edit(r, ctx)) \
                                       .props('flat dense size=sm') \
                                       .style('color:var(--muted);font-family:var(--font-ui);font-size:.78rem;')
                                     ui.button('✕',
-                                              on_click=lambda e, r=rec: self._on_cfg_delete(r)) \
+                                              on_click=lambda e, r=rec: self._on_cfg_delete(r, ctx)) \
                                       .props('flat dense size=sm') \
                                       .style('color:var(--danger);font-family:var(--font-ui);font-size:.78rem;')
 
-                        # Double-click → launch configured service command
-                        row.on('dblclick', lambda e, r=rec: self._on_cfg_launch(r))
+                        if is_local:
+                            # Local browser: double-click launches the configured command
+                            row.on('dblclick', lambda e, r=rec: self._on_cfg_launch(r))
 
-    def _poll_queue(self):
-        """Drain the inter-thread queue and update the GUI."""
+    def _drain_queue(self):
+        """Process all pending items from the shared queue, updating shared state.
+        Called by each connection's 100ms timer — idempotent if queue is empty."""
         changed      = False
         ping_changed = False
         try:
@@ -776,14 +872,13 @@ class DCon(object):
 
                 elif DCon.PING_RESULT in dev_dict:
                     results = dev_dict[DCon.PING_RESULT]
-                    for ip, reachable in results.items():
-                        if self._ping_cache.get(ip) != reachable:
-                            self._ping_cache[ip] = reachable
+                    for key, reachable in results.items():
+                        if self._ping_cache.get(key) != reachable:
+                            self._ping_cache[key] = reachable
                             ping_changed = True
 
                 else:
                     for svc in parse_services(dev_dict):
-                        # Restore any saved custom label
                         svc.custom_label = self._label_store.get(svc.key) or None
                         if svc.key not in self._services:
                             changed = True
@@ -792,17 +887,25 @@ class DCon(object):
         except Empty:
             pass
 
+        return changed, ping_changed
+
+    def _poll_queue(self, ctx: _ConnCtx):
+        """100ms timer callback — drains the shared queue then re-renders only
+        this connection's UI elements via its own ctx."""
+        changed, ping_changed = self._drain_queue()
+
         if changed:
-            self._render_discovered_table()
-            count = len(self._services)
+            self._render_discovered_table(ctx)
+            count    = len(self._services)
             ip_count = len({s.ip for s in self._services.values()})
-            self._status_el.set_content(
+            ctx.status_el.set_content(
                 f'<div class="status-bar">'
-                f'{count} service{"s" if count != 1 else ""} on {ip_count} device{"s" if ip_count != 1 else ""}'
+                f'{count} service{"s" if count != 1 else ""} on '
+                f'{ip_count} device{"s" if ip_count != 1 else ""}'
                 f'</div>'
             )
         if ping_changed:
-            self._render_configured_table()
+            self._render_configured_table(ctx)
 
     # ── Interactions ───────────────────────────────────────────────────────
 
@@ -818,7 +921,7 @@ class DCon(object):
         except Exception as ex:
             ui.notify(f"Launch failed: {ex}", type="negative")
 
-    def _on_edit(self, svc: ServiceEntry):
+    def _on_edit(self, svc: ServiceEntry, ctx: _ConnCtx):
         """Right-click: unified dialog to edit the device label, launch command,
         and inspect the raw discovery JSON for this service."""
         current_label = svc.custom_label or ""
@@ -901,7 +1004,7 @@ class DCon(object):
 
                     ui.notify("Changes saved", type="positive")
                     dlg.close()
-                    self._render_discovered_table()
+                    self._render_discovered_table(ctx)
 
                 ui.button("Save", on_click=_save).props('unelevated').style(
                     'background:var(--accent);color:#000'
@@ -911,8 +1014,8 @@ class DCon(object):
 
     # ── Configured Services interactions ───────────────────────────────────
 
-    def _cfg_dialog(self, title: str, name: str = "", ip: str = "", port: str = "",
-                    command: str = "", on_save=None):
+    def _cfg_dialog(self, title: str, ctx: _ConnCtx, name: str = "", ip: str = "",
+                    port: str = "", command: str = "", on_save=None):
         """Shared add/edit dialog for configured services."""
         with ui.dialog() as dlg, ui.card().style('min-width:480px'):
             ui.html(
@@ -954,7 +1057,7 @@ class DCon(object):
                     if on_save:
                         on_save(n, i, p, c)
                     dlg.close()
-                    self._render_configured_table()
+                    self._render_configured_table(ctx)
 
                 ui.button("Save", on_click=_save).props('unelevated').style(
                     'background:var(--accent);color:#000'
@@ -962,22 +1065,22 @@ class DCon(object):
 
         dlg.open()
 
-    def _on_cfg_add(self):
+    def _on_cfg_add(self, ctx: _ConnCtx):
         """Open dialog to add a new configured service."""
         def _save(name, ip, port, command):
             self._cfg_svc_store.add(name, ip, port, command)
             ui.notify(f"Added '{name}'", type="positive")
 
-        self._cfg_dialog("Add service", on_save=_save)
+        self._cfg_dialog("Add service", ctx, on_save=_save)
 
-    def _on_cfg_edit(self, rec: dict):
+    def _on_cfg_edit(self, rec: dict, ctx: _ConnCtx):
         """Open dialog to edit an existing configured service."""
         def _save(name, ip, port, command):
             self._cfg_svc_store.update(rec["id"], name, ip, port, command)
             ui.notify(f"Updated '{name}'", type="positive")
 
         self._cfg_dialog(
-            "Edit service",
+            "Edit service", ctx,
             name=rec["name"],
             ip=rec["ip"],
             port=str(rec["port"]),
@@ -1001,7 +1104,7 @@ class DCon(object):
         except Exception as ex:
             ui.notify(f"Launch failed: {ex}", type="negative")
 
-    def _on_cfg_delete(self, rec: dict):
+    def _on_cfg_delete(self, rec: dict, ctx: _ConnCtx):
         """Delete a configured service after confirmation."""
         with ui.dialog() as dlg, ui.card().style('min-width:320px'):
             ui.html(
@@ -1015,7 +1118,7 @@ class DCon(object):
                     self._cfg_svc_store.delete(rec["id"])
                     ui.notify(f"Deleted '{rec['name']}'", type="positive")
                     dlg.close()
-                    self._render_configured_table()
+                    self._render_configured_table(ctx)
 
                 ui.button("Delete", on_click=_confirm).props('unelevated').style(
                     'background:var(--danger);color:#fff'
@@ -1041,6 +1144,10 @@ def main():
         parser.add_argument("-d", "--debug",   action='store_true', help="Enable debugging.")
         parser.add_argument("-s", "--seconds", type=int, default=10, help="Device poll time in seconds (default=10).")
         parser.add_argument("-p", "--port",    type=int, default=8090, help="TCP port for the NiceGUI server (default=8090).")
+        parser.add_argument("--host",          type=str, default="0.0.0.0",
+                            help="Host/IP the NiceGUI server binds to (default=0.0.0.0, all interfaces).")
+        parser.add_argument("--local",         action='store_true',
+                            help="Bind to localhost only (127.0.0.1). Overrides --host.")
         launcher = Launcher("icon.png", app_name="dcon")
         launcher.addLauncherArgs(parser)
         BootManager.AddCmdArgs(parser)

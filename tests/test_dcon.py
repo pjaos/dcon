@@ -40,10 +40,15 @@ def _make_stubs():
     """Insert minimal stubs for nicegui, p3lib and rich so dcon.py can be
     imported without a browser or the real packages installed."""
 
-    # nicegui
-    nicegui = types.ModuleType("nicegui")
-    nicegui.ui  = MagicMock()
-    nicegui.app = MagicMock()
+    # nicegui — stub ui, app, and Client
+    nicegui        = types.ModuleType("nicegui")
+    nicegui.ui     = MagicMock()
+    nicegui.app    = MagicMock()
+    # Client.current is accessed in _is_local_client(); stub it to look local
+    mock_client         = MagicMock()
+    mock_client.current = MagicMock()
+    mock_client.current.ip = '127.0.0.1'
+    nicegui.Client  = mock_client
     sys.modules.setdefault("nicegui", nicegui)
 
     # rich
@@ -117,6 +122,7 @@ ServiceLabelStore      = _module.ServiceLabelStore
 ConfiguredServiceStore = _module.ConfiguredServiceStore
 parse_services         = _module.parse_services
 AreYouThereThread      = _module.AreYouThereThread
+DCon                   = _module.DCon
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -767,6 +773,67 @@ class TestConfiguredServiceStore(unittest.TestCase):
         lst = store.all()
         lst.clear()
         self.assertEqual(len(store.all()), 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DCon._make_url  and  DCon._is_local_client
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDConHelpers(unittest.TestCase):
+
+    # ── _make_url ─────────────────────────────────────────────────────────────
+
+    def test_make_url_port_80_is_http(self):
+        self.assertEqual(DCon._make_url("192.168.1.1", 80), "http://192.168.1.1:80")
+
+    def test_make_url_port_8080_is_http(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 8080), "http://10.0.0.1:8080")
+
+    def test_make_url_port_443_is_https(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 443), "https://10.0.0.1:443")
+
+    def test_make_url_port_8443_is_https(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 8443), "https://10.0.0.1:8443")
+
+    def test_make_url_port_22_is_ssh(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 22), "ssh://10.0.0.1:22")
+
+    def test_make_url_port_23_is_telnet(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 23), "telnet://10.0.0.1:23")
+
+    def test_make_url_port_21_is_ftp(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 21), "ftp://10.0.0.1:21")
+
+    def test_make_url_port_990_is_ftps(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 990), "ftps://10.0.0.1:990")
+
+    def test_make_url_port_445_is_smb(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 445), "smb://10.0.0.1:445")
+
+    def test_make_url_port_554_is_rtsp(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 554), "rtsp://10.0.0.1:554")
+
+    def test_make_url_port_3389_is_rdp(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 3389), "rdp://10.0.0.1:3389")
+
+    def test_make_url_port_5900_is_vnc(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 5900), "vnc://10.0.0.1:5900")
+
+    def test_make_url_unknown_port_defaults_to_http(self):
+        self.assertEqual(DCon._make_url("10.0.0.1", 9999), "http://10.0.0.1:9999")
+
+    def test_make_url_contains_ip_and_port(self):
+        url = DCon._make_url("172.16.0.1", 8888)
+        self.assertIn("172.16.0.1", url)
+        self.assertIn("8888", url)
+
+    # ── _is_local_client is removed — detection is now done via the Client
+    # parameter injected by @ui.page, so there is nothing to unit-test here.
+    # The make_url tests below remain unchanged.
+
+    def tearDown(self):
+        # Restore the default stub ip after each test
+        _module.Client.current.ip = '127.0.0.1'
 
 
 if __name__ == "__main__":

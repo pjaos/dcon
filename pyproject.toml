@@ -1,6 +1,6 @@
 [project]
 name = "dcon"
-version = "0.1.1"
+version = "0.1.5"
 description = "An app to enable a single point of connectivity to the various in house devices and software programs that provide interfaces to other devices."
 authors = [
     {name = "Paul Austen",email = "pjaos@gmail.com"}
@@ -15,7 +15,7 @@ packages = [{include = "dcon", from = "src"}]
 
 [tool.poetry.dependencies]
 pytest = "*"
-nicegui = "^3.10.0"
+nicegui = "^3.12.0"
 p3lib = "^1.1.162"
 rich = "*"
 psutil = "*"
